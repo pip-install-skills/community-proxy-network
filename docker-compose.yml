@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile  # Use the Dockerfile in the current directory
+    image: sporo-patient-chart-review-api-fastapi:latest  # Custom image name (myapp_fastapi) with tag 'latest'
+    ports:
+      - "8000:8000"  # Map port 8000 on the host to port 8000 in the container
+    volumes:
+      - .:/app  # Mount the current directory to /app in the container
+    environment:
+      - PYTHONUNBUFFERED=1  # You can still add specific variables here if needed
+    env_file:
+      - .env  # Reference to your .env file
