@@ -1,57 +1,81 @@
+# server.py
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from sqlmodel import SQLModel, Session, create_engine, select
-from models import Node
+from typing import Dict, Deque, Optional
+from collections import deque
+
 import asyncio
+import contextlib
 import json
 import os
-import random
+import uuid
+
+from models import Node  # keep using your existing model
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./nodes.db")
 engine = create_engine(DATABASE_URL, echo=False)
+
 app = FastAPI(title="Community Proxy Control Plane")
 
-# In-memory ws connections
-WS_CONNECTIONS = {}
+# ----------------------
+# Connection registries
+# ----------------------
+# Control channels per node (for commands from server -> agent)
+WS_CONTROL: Dict[str, WebSocket] = {}
+
+# Pending tunnel futures: exit agent will attach the data WS here
+PENDING_TUNNELS: Dict[str, asyncio.Future] = {}
+
+# Round-robin pool of exit candidates (node_ids with active control WS)
+EXIT_POOL: Deque[str] = deque()
+
 
 @app.on_event("startup")
 def on_startup():
     SQLModel.metadata.create_all(engine)
 
-# Node registration
+
+# ----------------------
+# Node registration & heartbeat
+# ----------------------
 @app.post("/register")
-async def register(node_id: str, public_key: str = None, ip: str = None, country: str = None):
+async def register(node_id: str, public_key: str | None = None, ip: str | None = None, country: str | None = None):
     with Session(engine) as session:
         existing = session.exec(select(Node).where(Node.node_id == node_id)).first()
+        now = datetime.now(timezone.utc)
         if existing:
             existing.public_key = public_key or existing.public_key
             existing.ip = ip or existing.ip
             existing.country = country or existing.country
-            existing.last_seen = datetime.now(timezone.utc)
+            existing.last_seen = now
             session.add(existing)
             session.commit()
             return {"status": "ok", "node_id": node_id}
 
-        node = Node(node_id=node_id, public_key=public_key, ip=ip, country=country)
+        node = Node(node_id=node_id, public_key=public_key, ip=ip, country=country, last_seen=now)
         session.add(node)
         session.commit()
         return {"status": "registered", "node_id": node_id}
 
-# Heartbeat
+
 @app.post("/heartbeat")
 async def heartbeat(node_id: str):
     with Session(engine) as session:
         node = session.exec(select(Node).where(Node.node_id == node_id)).first()
         if not node:
             raise HTTPException(status_code=404, detail="node not found")
-        node.last_seen = datetime.utcnow()
+        node.last_seen = datetime.now(timezone.utc)
         session.add(node)
         session.commit()
         return {"status": "ok"}
 
-# Match endpoint (naive)
+
+# ----------------------
+# Simple matcher (unchanged semantics)
+# ----------------------
 @app.get("/match")
-async def match(credits_required: int = 0, country: str = None):
+async def match(credits_required: int = 0, country: str | None = None):
     with Session(engine) as session:
         q = select(Node).where(Node.banned == False)
         if country:
@@ -61,122 +85,157 @@ async def match(credits_required: int = 0, country: str = None):
             raise HTTPException(status_code=404, detail="no node available")
         return {"node_id": node.node_id, "ip": node.ip, "country": node.country}
 
-# WebSocket for agent management
+
+# ----------------------
+# WebSocket: control channel per node
+# ----------------------
 @app.websocket("/ws/node/{node_id}")
 async def ws_node(websocket: WebSocket, node_id: str):
     await websocket.accept()
-    WS_CONNECTIONS[node_id] = websocket
+    WS_CONTROL[node_id] = websocket
+    if node_id not in EXIT_POOL:
+        EXIT_POOL.append(node_id)
+
+    # Mark node online in DB
+    with Session(engine) as session:
+        node = session.exec(select(Node).where(Node.node_id == node_id)).first()
+        if node:
+            node.last_seen = datetime.now(timezone.utc)
+            session.add(node)
+            session.commit()
+
     try:
         while True:
-            data = await websocket.receive_text()
-            print(f"WS from {node_id}: {data}")
-            await websocket.send_text(f"ack: {data}")
+            # Optional: handle keepalives or small control msgs from agent
+            _ = await websocket.receive_text()
     except WebSocketDisconnect:
-        WS_CONNECTIONS.pop(node_id, None)
-        print(f"WS disconnected: {node_id}")
+        WS_CONTROL.pop(node_id, None)
+        with contextlib.suppress(ValueError):
+            EXIT_POOL.remove(node_id)
 
-# Send command to a node
-@app.post("/send-command/{node_id}")
-async def send_command(node_id: str, cmd: str):
-    ws = WS_CONNECTIONS.get(node_id)
-    if not ws:
-        raise HTTPException(status_code=404, detail="node not connected")
-    await ws.send_text(cmd)
-    return {"status": "sent"}
 
 # ----------------------
-# Proxy routing logic
+# WebSocket: exit agent attaches the data tunnel here
+# ----------------------
+@app.websocket("/ws/tunnel/{node_id}/{tunnel_id}")
+async def ws_tunnel(websocket: WebSocket, node_id: str, tunnel_id: str):
+    await websocket.accept()
+    fut = PENDING_TUNNELS.get(tunnel_id)
+    if fut and not fut.done():
+        fut.set_result(websocket)
+    else:
+        # No pending waiter; close
+        await websocket.close()
+
+
+# ----------------------
+# WebSocket: origin agent (SOCKS client side) connects here per target
+# Server selects an exit node (round-robin) and bridges origin_ws <-> exit_ws
 # ----------------------
 @app.websocket("/ws/proxy/{node_id}")
 async def ws_proxy(websocket: WebSocket, node_id: str):
-    """
-    This endpoint accepts WebSocket connections from agents for SOCKS5 traffic.
-    It supports multi-node routing: the control plane can forward requests
-    to any connected node instead of the originating agent.
-    """
     await websocket.accept()
-    print(f"Proxy WS connected: {node_id}")
     try:
-        # First message must be {"cmd":"connect","host":"example.com","port":80}
-        msg = await websocket.receive_text()
-        cmd = json.loads(msg)
-        if cmd.get("cmd") != "connect":
-            await websocket.send_text(json.dumps({"error":"first message must be connect"}))
-            await websocket.close()
-            return
+        # First message must be a JSON connect command
+        first_msg = await websocket.receive_text()
+        try:
+            first = json.loads(first_msg)
+        except Exception:
+            await websocket.send_text(json.dumps({"error": "invalid json"}))
+            return await websocket.close()
+        if first.get("cmd") != "connect":
+            await websocket.send_text(json.dumps({"error": "first message must be connect"}))
+            return await websocket.close()
 
-        target_host = cmd["host"]
-        target_port = int(cmd.get("port", 80))
+        target_host = first["host"]
+        target_port = int(first.get("port", 80))
 
-        # Select a node for multi-node routing (random pick)
-        available_nodes = [n for n in WS_CONNECTIONS.keys() if n != node_id]
-        if available_nodes:
-            chosen_node_id = random.choice(available_nodes)
-            node_ws = WS_CONNECTIONS[chosen_node_id]
-        else:
-            # fallback: use the originating node
-            chosen_node_id = node_id
-            node_ws = websocket
+        # Round-robin exit node selection
+        if not EXIT_POOL:
+            await websocket.send_text(json.dumps({"error": "no exit nodes available"}))
+            return await websocket.close()
 
-        # Send connect command to chosen node if it's not the current websocket
-        if chosen_node_id != node_id:
-            await node_ws.send_text(json.dumps({"cmd":"connect","host":target_host,"port":target_port}))
-            # Wait for confirmation
-            resp_msg = await node_ws.receive_text()
-            resp = json.loads(resp_msg)
-            if resp.get("status") != "connected":
-                await websocket.send_text(json.dumps({"error":"node failed to connect"}))
-                await websocket.close()
-                return
+        chosen_id: Optional[str] = None
+        for _ in range(len(EXIT_POOL)):
+            candidate = EXIT_POOL[0]
+            EXIT_POOL.rotate(-1)
+            if candidate in WS_CONTROL:
+                # Avoid self-egress if you want strict multi-node; allow if only node
+                if candidate != node_id or len(EXIT_POOL) == 1:
+                    chosen_id = candidate
+                    break
 
-        # TCP connection from the chosen node
-        reader, writer = await asyncio.open_connection(target_host, target_port)
+        if not chosen_id:
+            await websocket.send_text(json.dumps({"error": "no valid exit node found"}))
+            return await websocket.close()
 
-        # Inform original agent we're connected
-        await websocket.send_text(json.dumps({"status":"connected"}))
+        control_ws = WS_CONTROL.get(chosen_id)
+        if not control_ws:
+            await websocket.send_text(json.dumps({"error": "exit node not connected"}))
+            return await websocket.close()
 
-        # ws -> TCP
-        async def ws_to_sock(ws_conn, tcp_writer):
+        # Create pending tunnel & ask exit to connect
+        tunnel_id = uuid.uuid4().hex
+        fut = asyncio.get_event_loop().create_future()
+        PENDING_TUNNELS[tunnel_id] = fut
+
+        cmd = {"cmd": "connect", "host": target_host, "port": target_port, "tunnel": tunnel_id}
+        await control_ws.send_text(json.dumps(cmd))
+
+        # Wait for exit agent to attach the tunnel
+        try:
+            exit_ws: WebSocket = await asyncio.wait_for(fut, timeout=10)
+        except asyncio.TimeoutError:
+            PENDING_TUNNELS.pop(tunnel_id, None)
+            await websocket.send_text(json.dumps({"error": "exit node did not open tunnel"}))
+            return await websocket.close()
+        finally:
+            PENDING_TUNNELS.pop(tunnel_id, None)
+
+        # Exit node sends a small status JSON first
+        status_msg = await exit_ws.receive_text()
+        try:
+            status = json.loads(status_msg)
+        except Exception:
+            status = {"status": "connected"}
+        if status.get("status") != "connected":
+            await websocket.send_text(json.dumps({"error": "exit connection failed"}))
+            with contextlib.suppress(Exception):
+                await exit_ws.close()
+            return await websocket.close()
+
+        # Inform origin
+        await websocket.send_text(json.dumps({"status": "connected", "exit": chosen_id}))
+
+        async def pump(src: WebSocket, dst: WebSocket):
             try:
                 while True:
-                    data = await ws_conn.receive_bytes()
-                    if data is None:
-                        break
-                    tcp_writer.write(data)
-                    await tcp_writer.drain()
+                    data = await src.receive_bytes()
+                    await dst.send_bytes(data)
             except Exception:
                 pass
             finally:
-                tcp_writer.close()
+                with contextlib.suppress(Exception):
+                    await dst.close()
 
-        # TCP -> ws
-        async def sock_to_ws(ws_conn, tcp_reader):
+        async def pump_rev(src: WebSocket, dst: WebSocket):
             try:
                 while True:
-                    data = await tcp_reader.read(4096)
-                    if not data:
-                        break
-                    await ws_conn.send_bytes(data)
+                    data = await src.receive_bytes()
+                    await dst.send_bytes(data)
             except Exception:
                 pass
             finally:
-                try:
-                    await ws_conn.close()
-                except:
-                    pass
+                with contextlib.suppress(Exception):
+                    await dst.close()
 
         await asyncio.gather(
-            ws_to_sock(websocket, writer),
-            sock_to_ws(websocket, reader)
+            pump(websocket, exit_ws),
+            pump_rev(exit_ws, websocket),
         )
 
     except Exception as e:
-        try:
+        with contextlib.suppress(Exception):
             await websocket.send_text(json.dumps({"error": str(e)}))
-        except:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             await websocket.close()
-        except:
-            pass
-        print(f"Proxy WS error: {e}")
