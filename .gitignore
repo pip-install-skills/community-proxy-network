@@ -126,3 +126,4 @@ dmypy.json
 
 *.exe
 nodes.db
+test.py
