@@ -14,8 +14,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var serverURL string
-var nodeID string
+var (
+	serverURL string
+	nodeID    string
+)
 
 func init() {
 	flag.StringVar(&serverURL, "server", "http://localhost:8000", "control plane URL")
@@ -26,7 +28,6 @@ func init() {
 	}
 }
 
-// register node with control plane
 func register() error {
 	url := fmt.Sprintf("%s/register?node_id=%s&ip=127.0.0.1", serverURL, nodeID)
 	resp, err := http.Post(url, "application/json", nil)
@@ -37,7 +38,18 @@ func register() error {
 	return nil
 }
 
-// websocketReadWriteCloser adapts gorilla websocket to a net.Conn
+func heartbeatLoop() {
+	for {
+		url := fmt.Sprintf("%s/heartbeat?node_id=%s", serverURL, nodeID)
+		_, err := http.Post(url, "application/json", nil)
+		if err != nil {
+			log.Printf("heartbeat err: %v", err)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// --- WebSocket read/write adapter ---
 type websocketReadWriteCloser struct {
 	conn *websocket.Conn
 }
@@ -59,11 +71,7 @@ func (w *websocketReadWriteCloser) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (w *websocketReadWriteCloser) Close() error {
-	return w.conn.Close()
-}
-
-// Important: return dummy but non-nil addresses for SOCKS5
+func (w *websocketReadWriteCloser) Close() error { return w.conn.Close() }
 func (w *websocketReadWriteCloser) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4zero, Port: 1080}
 }
@@ -74,29 +82,42 @@ func (w *websocketReadWriteCloser) SetDeadline(t time.Time) error      { return 
 func (w *websocketReadWriteCloser) SetReadDeadline(t time.Time) error  { return nil }
 func (w *websocketReadWriteCloser) SetWriteDeadline(t time.Time) error { return nil }
 
-// wrappedConn preserves actual client addresses for SOCKS5
-type wrappedConn struct {
-	net.Conn
-	localAddr, remoteAddr net.Addr
-}
-
-func (w *wrappedConn) LocalAddr() net.Addr                { return w.localAddr }
-func (w *wrappedConn) RemoteAddr() net.Addr               { return w.remoteAddr }
-func (w *wrappedConn) SetDeadline(t time.Time) error      { return w.Conn.SetDeadline(t) }
-func (w *wrappedConn) SetReadDeadline(t time.Time) error  { return w.Conn.SetReadDeadline(t) }
-func (w *wrappedConn) SetWriteDeadline(t time.Time) error { return w.Conn.SetWriteDeadline(t) }
-
+// --- Actual distributed proxy logic ---
 func startSocks(local string) error {
 	conf := &socks5.Config{
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// Convert HTTP(S) URL to WS(WSS)
+			// Ask control plane which node to use
+			matchURL := fmt.Sprintf("%s/match", serverURL)
+			resp, err := http.Get(matchURL)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+
+			var node struct {
+				NodeID  string `json:"node_id"`
+				IP      string `json:"ip"`
+				Country string `json:"country"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
+				return nil, err
+			}
+			log.Printf("Control plane selected node: %s (%s)", node.NodeID, node.IP)
+
+			// If the control plane chose *this* node, connect directly
+			if node.NodeID == nodeID {
+				log.Printf("Using local node for %s", addr)
+				return net.Dial(network, addr)
+			}
+
+			// Otherwise, connect through selected remote node via control plane WebSocket
 			wsurl := serverURL
 			if wsurl[:5] == "http:" {
 				wsurl = "ws:" + wsurl[5:]
 			} else if wsurl[:6] == "https:" {
 				wsurl = "wss:" + wsurl[6:]
 			}
-			wsurl = fmt.Sprintf("%s/ws/proxy/%s", wsurl, nodeID)
+			wsurl = fmt.Sprintf("%s/ws/proxy/%s", wsurl, node.NodeID)
 
 			header := http.Header{}
 			dialer := websocket.DefaultDialer
@@ -105,14 +126,13 @@ func startSocks(local string) error {
 				return nil, err
 			}
 
-			// Split addr into host and port
+			// Split host/port
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				host = addr
 				port = "80"
 			}
 
-			// Send connect request over WebSocket
 			cmd := map[string]interface{}{"cmd": "connect", "host": host, "port": port}
 			cmdj, _ := json.Marshal(cmd)
 			if err := c.WriteMessage(websocket.TextMessage, cmdj); err != nil {
@@ -120,17 +140,17 @@ func startSocks(local string) error {
 				return nil, err
 			}
 
-			// Wait for confirmation
+			// Wait for "connected"
 			_, msg, err := c.ReadMessage()
 			if err != nil {
 				c.Close()
 				return nil, err
 			}
-			var resp map[string]interface{}
-			_ = json.Unmarshal(msg, &resp)
-			if resp["status"] != "connected" {
+			var respj map[string]interface{}
+			_ = json.Unmarshal(msg, &respj)
+			if respj["status"] != "connected" {
 				c.Close()
-				return nil, fmt.Errorf("proxy not connected: %v", resp)
+				return nil, fmt.Errorf("remote proxy failed: %v", respj)
 			}
 
 			return &websocketReadWriteCloser{conn: c}, nil
@@ -146,6 +166,7 @@ func startSocks(local string) error {
 	if err != nil {
 		return err
 	}
+
 	log.Printf("SOCKS5 listening on %s", local)
 	for {
 		conn, err := ln.Accept()
@@ -153,29 +174,10 @@ func startSocks(local string) error {
 			log.Printf("accept err: %v", err)
 			continue
 		}
-
-		wrapped := &wrappedConn{
-			Conn:       conn,
-			localAddr:  conn.LocalAddr(),
-			remoteAddr: conn.RemoteAddr(),
-		}
-
 		go func(c net.Conn) {
 			defer c.Close()
 			server.ServeConn(c)
-		}(wrapped)
-	}
-}
-
-// Heartbeat to keep node alive in control plane
-func heartbeatLoop() {
-	for {
-		url := fmt.Sprintf("%s/heartbeat?node_id=%s", serverURL, nodeID)
-		_, err := http.Post(url, "application/json", nil)
-		if err != nil {
-			log.Printf("heartbeat err: %v", err)
-		}
-		time.Sleep(10 * time.Second)
+		}(conn)
 	}
 }
 
@@ -186,12 +188,7 @@ func main() {
 	}
 	go heartbeatLoop()
 
-	// Start SOCKS5 listener
-	go func() {
-		if err := startSocks("127.0.0.1:1080"); err != nil {
-			log.Fatalf("socks failed: %v", err)
-		}
-	}()
-
-	select {} // keep main alive
+	if err := startSocks("127.0.0.1:1080"); err != nil {
+		log.Fatalf("socks failed: %v", err)
+	}
 }
